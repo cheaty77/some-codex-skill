@@ -1,0 +1,3 @@
+interface:
+  display_name: "Campaign Content Factory"
+  short_description: "Infer, generate, and validate new campaign chapters"
