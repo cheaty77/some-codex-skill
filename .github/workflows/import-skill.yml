@@ -1,0 +1,151 @@
+name: Import skill from issue
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  import-skill:
+    if: startsWith(github.event.issue.title, '[skill]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout collection repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse issue and import skill
+        id: import
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Extract the first GitHub /tree/ URL from the issue body.
+          URL="$(printf '%s\n' "$ISSUE_BODY" | grep -Eo 'https://github\.com/[^[:space:]<>]+/[^[:space:]<>]+/tree/[^[:space:]<>]+' | head -n 1 || true)"
+          URL="${URL%%\)*}"
+          URL="${URL%%\]*}"
+
+          if [[ -z "$URL" ]]; then
+            echo "No valid GitHub directory URL containing /tree/ was found." >&2
+            exit 1
+          fi
+
+          REST="${URL#https://github.com/}"
+          OWNER="${REST%%/*}"
+          REST="${REST#*/}"
+          REPO="${REST%%/*}"
+          REST="${REST#*/tree/}"
+
+          # Resolve branch names robustly, including branches containing '/'.
+          git ls-remote --heads "https://github.com/${OWNER}/${REPO}.git" > /tmp/heads
+          REF=""
+          PATH_IN_REPO=""
+          while IFS=$'\t' read -r _sha ref; do
+            branch="${ref#refs/heads/}"
+            prefix="${branch}/"
+            if [[ "$REST" == "$prefix"* ]]; then
+              if (( ${#branch} > ${#REF} )); then
+                REF="$branch"
+                PATH_IN_REPO="${REST#"$prefix"}"
+              fi
+            fi
+          done < /tmp/heads
+
+          if [[ -z "$REF" || -z "$PATH_IN_REPO" ]]; then
+            echo "Could not resolve branch and directory from URL: $URL" >&2
+            exit 1
+          fi
+
+          TMP="$(mktemp -d)"
+          git clone --quiet --depth 1 --branch "$REF" --filter=blob:none --sparse \
+            "https://github.com/${OWNER}/${REPO}.git" "$TMP/source"
+          git -C "$TMP/source" sparse-checkout set --no-cone "/${PATH_IN_REPO}/"
+
+          SOURCE_DIR="$TMP/source/$PATH_IN_REPO"
+          if [[ ! -d "$SOURCE_DIR" ]]; then
+            echo "Source directory does not exist: $PATH_IN_REPO" >&2
+            exit 1
+          fi
+
+          LEAF="$(basename "$PATH_IN_REPO")"
+          SAFE_OWNER="$(printf '%s' "$OWNER" | tr -cs 'A-Za-z0-9._-' '-')"
+          SAFE_REPO="$(printf '%s' "$REPO" | tr -cs 'A-Za-z0-9._-' '-')"
+          SAFE_LEAF="$(printf '%s' "$LEAF" | tr -cs 'A-Za-z0-9._-' '-')"
+          DEST="skills/${SAFE_OWNER}--${SAFE_REPO}--${SAFE_LEAF}"
+
+          if [[ -e "$DEST" ]]; then
+            echo "Destination already exists: $DEST" >&2
+            exit 1
+          fi
+
+          mkdir -p skills
+          cp -a "$SOURCE_DIR" "$DEST"
+          SOURCE_COMMIT="$(git -C "$TMP/source" rev-parse HEAD)"
+
+          python3 - "$DEST/_source.json" "$OWNER" "$REPO" "$REF" "$PATH_IN_REPO" "$URL" "$SOURCE_COMMIT" <<'PY'
+          import json, sys
+          out, owner, repo, ref, path, url, commit = sys.argv[1:]
+          with open(out, "w", encoding="utf-8") as f:
+              json.dump({
+                  "repository": f"{owner}/{repo}",
+                  "branch": ref,
+                  "path": path,
+                  "url": url,
+                  "source_commit": commit,
+              }, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+
+          echo "dest=$DEST" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Commit imported skill
+        env:
+          DEST: ${{ steps.import.outputs.dest }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$DEST"
+          git commit -m "Import skill: ${DEST#skills/}"
+          git push
+
+      - name: Close successful issue
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const dest = '${{ steps.import.outputs.dest }}';
+            const url = '${{ steps.import.outputs.url }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Imported ${url} into \`${dest}\`.`
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+
+      - name: Explain failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Import failed. Check the Actions run for details. Make sure the URL points to a directory in a **public** GitHub repository and contains `/tree/<branch>/<path>`.'
+            });
