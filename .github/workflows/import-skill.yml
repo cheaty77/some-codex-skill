@@ -2,7 +2,7 @@ name: Import skill from issue
 
 on:
   issues:
-    types: [opened]
+    types: [opened, edited, reopened]
 
 permissions:
   contents: write
@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   import-skill:
-    if: startsWith(github.event.issue.title, '[skill]')
+    # Mobile GitHub does not always expose Issue Forms. Treat any issue whose
+    # body contains a GitHub directory URL as an import request.
+    if: contains(github.event.issue.body, 'https://github.com/') && contains(github.event.issue.body, '/tree/')
     runs-on: ubuntu-latest
 
     steps:
